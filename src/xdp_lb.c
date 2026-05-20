@@ -17,11 +17,10 @@
 #include <bpf/bpf_endian.h>
 
 // ── Hardcoded configuration ──────────────────────────────────────────────────
-// update backend with my local linux machine for now
+// update to host machines addresses.
 #define TARGET_PORT  80            
 #define BACKEND_IP   0x0a000002u   
 
-// Backend MAC address (aa:bb:cc:dd:ee:ff) — update to your actual backend NIC
 #define BACKEND_MAC_0 0xaa
 #define BACKEND_MAC_1 0xbb
 #define BACKEND_MAC_2 0xcc

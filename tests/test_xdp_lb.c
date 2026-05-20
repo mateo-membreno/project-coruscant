@@ -67,9 +67,6 @@ struct udphdr {
     uint16_t check;
 } __attribute__((packed));
 
-#define IPPROTO_TCP 6
-#define IPPROTO_UDP 17
-
 // ── IP checksum (same algorithm as in xdp_lb.c) ─────────────────────────────
 
 static uint16_t ip_csum(struct iphdr *iph)
