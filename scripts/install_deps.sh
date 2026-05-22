@@ -11,9 +11,12 @@ apt-get install -y \
     cmake \
     make \
     gcc \
+    g++ \
     linux-headers-$(uname -r) \
-    iproute2 \
     libbpf-dev \
+    libelf-dev \
+    zlib1g-dev \
+    iproute2 \
     git
 
 echo ""
