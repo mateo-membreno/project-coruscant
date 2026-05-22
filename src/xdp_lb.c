@@ -130,6 +130,7 @@ int xdp_lb(struct xdp_md *ctx)
     __u32 idx = hash_4tuple(iph->saddr, iph->daddr, sport, dport) % val->count;
     if (idx >= MAX_BACKENDS)
         return XDP_PASS;
+    idx &= MAX_BACKENDS - 1;  // give the BPF verifier a concrete bitmask to track
 
     struct backend_entry *be = &val->backends[idx];
 
