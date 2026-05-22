@@ -130,7 +130,11 @@ int xdp_lb(struct xdp_md *ctx)
     __u32 idx = hash_4tuple(iph->saddr, iph->daddr, sport, dport) % val->count;
     if (idx >= MAX_BACKENDS)
         return XDP_PASS;
-    idx &= MAX_BACKENDS - 1;  // give the BPF verifier a concrete bitmask to track
+    // LLVM proves idx < count ≤ MAX_BACKENDS and removes a plain mask as a no-op.
+    // The asm barrier breaks that alias analysis so the AND is emitted, giving
+    // the BPF verifier a concrete bitmask it can use to bound the value.
+    asm volatile("" : "+r"(idx));
+    idx &= MAX_BACKENDS - 1;
 
     struct backend_entry *be = &val->backends[idx];
 
