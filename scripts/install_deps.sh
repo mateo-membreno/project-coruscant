@@ -12,6 +12,7 @@ apt-get install -y \
     make \
     gcc \
     g++ \
+    gcc-multilib \
     linux-headers-$(uname -r) \
     libbpf-dev \
     libelf-dev \
