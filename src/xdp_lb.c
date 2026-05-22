@@ -19,6 +19,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef IP_DF
+#define IP_DF 0x4000
+#endif
+
 #include "lb_common.h"
 
 // ── eBPF maps ─────────────────────────────────────────────────────────────────
