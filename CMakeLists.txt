@@ -9,7 +9,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_program(CLANG clang REQUIRED)
 
     add_custom_command(
-        OUTPUT  ${CMAKE_SOURCE_DIR}/src/xdp_lb.o
+        OUTPUT  ${CMAKE_BINARY_DIR}/xdp_lb.o
         COMMAND ${CLANG}
                 -O2 -g -Wall
                 -target bpf
@@ -18,14 +18,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 -I/usr/include/
                 -I/usr/include/x86_64-linux-gnu
                 -c ${CMAKE_SOURCE_DIR}/src/xdp_lb.c
-                -o ${CMAKE_SOURCE_DIR}/src/xdp_lb.o
+                -o ${CMAKE_BINARY_DIR}/xdp_lb.o
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_BINARY_DIR}/xdp_lb.o
+                ${CMAKE_SOURCE_DIR}/src/xdp_lb.o
         DEPENDS ${CMAKE_SOURCE_DIR}/src/xdp_lb.c
                 ${CMAKE_SOURCE_DIR}/src/lb_common.h
         COMMENT "Compiling XDP eBPF program"
     )
 
     add_custom_target(xdp_lb ALL
-        DEPENDS ${CMAKE_SOURCE_DIR}/src/xdp_lb.o
+        DEPENDS ${CMAKE_BINARY_DIR}/xdp_lb.o
     )
 
     find_library(LIBBPF_LIB bpf)
