@@ -1,16 +1,19 @@
 // Userspace controller for the XDP load balancer.
 //
 // Commands:
-//   lb_ctrl attach <iface> [obj]           load xdp_lb.o, create+pin both maps
+//   lb_ctrl attach <iface> [obj]           load xdp_lb.o, create+pin all maps
 //   lb_ctrl detach <iface>                  remove XDP program, unpin maps
+//   lb_ctrl setlbip <ip>                   set LB source IP for DSR IP-in-IP tunnels
 //   lb_ctrl add <vip> <port> <ip> <mac>    add backend to both active + config maps
 //   lb_ctrl del <vip> <port>               remove VIP entry from both maps
 //   lb_ctrl list                            print active VIPs and their backends
 //
-// Two pinned maps are maintained:
-//   MAP_PIN_PATH   — backends_map: active backends read by the XDP program
-//   CONFIG_PIN_PATH — config_map:  full configured set, used by lb_healthd
-//                                  to restore backends after they recover
+// Three pinned maps are maintained:
+//   MAP_PIN_PATH    — backends_map: active backends read by the XDP program
+//   CONFIG_PIN_PATH — config_map:   full configured set, used by lb_healthd
+//                                   to restore backends after they recover
+//   LBIP_PIN_PATH   — lbip_map:     single-entry array holding the LB's own IP,
+//                                   used as the outer IP-in-IP source address
 //
 // lb_healthd reads config_map as the source of truth and writes backends_map
 // based on health probe results.
@@ -31,6 +34,7 @@
 
 static constexpr const char *MAP_PIN_PATH    = "/sys/fs/bpf/lb_backends";
 static constexpr const char *CONFIG_PIN_PATH = "/sys/fs/bpf/lb_config";
+static constexpr const char *LBIP_PIN_PATH   = "/sys/fs/bpf/lb_lbip";
 static constexpr const char *DEFAULT_OBJ     = "src/xdp_lb.o";
 static constexpr __u32       XDP_FLAGS       = XDP_FLAGS_SKB_MODE;
 
@@ -53,10 +57,11 @@ static void usage(const char *prog)
         "Usage:\n"
         "  %s attach <iface> [bpf_obj]            load XDP program (default: %s)\n"
         "  %s detach <iface>                       detach XDP program\n"
+        "  %s setlbip <ip>                         set LB source IP for DSR tunnels\n"
         "  %s add <vip> <port> <backend_ip> <mac>  add backend\n"
         "  %s del <vip> <port>                     remove VIP entry\n"
         "  %s list                                 show all active VIP entries\n",
-        prog, DEFAULT_OBJ, prog, prog, prog, prog);
+        prog, DEFAULT_OBJ, prog, prog, prog, prog, prog);
 }
 
 // Write val to map_fd at key, logging errors with label.
@@ -135,6 +140,24 @@ public:
             return false;
         }
 
+        // Pin the DSR LB-IP map.
+        struct bpf_map *lbip_map =
+            bpf_object__find_map_by_name(obj_, "lbip_map");
+        if (!lbip_map) {
+            fprintf(stderr, "map 'lbip_map' not found in object\n");
+            bpf_xdp_detach(ifindex, XDP_FLAGS, nullptr);
+            remove(MAP_PIN_PATH);
+            return false;
+        }
+        remove(LBIP_PIN_PATH);
+        if (bpf_obj_pin(bpf_map__fd(lbip_map), LBIP_PIN_PATH)) {
+            fprintf(stderr, "bpf_obj_pin(lbip_map → %s): %s\n",
+                    LBIP_PIN_PATH, strerror(errno));
+            bpf_xdp_detach(ifindex, XDP_FLAGS, nullptr);
+            remove(MAP_PIN_PATH);
+            return false;
+        }
+
         // Create and pin the config map (userspace-only; not in the BPF object).
         // lb_healthd reads this as the authoritative backend list.
         remove(CONFIG_PIN_PATH);
@@ -181,6 +204,7 @@ static int cmd_attach(const char *iface, const char *obj_path)
     printf("xdp_lb attached to %s\n", iface);
     printf("  active map : %s\n", MAP_PIN_PATH);
     printf("  config map : %s\n", CONFIG_PIN_PATH);
+    printf("  lbip map   : %s  (run 'setlbip' to configure)\n", LBIP_PIN_PATH);
     return 0;
 }
 
@@ -197,6 +221,7 @@ static int cmd_detach(const char *iface)
     }
     remove(MAP_PIN_PATH);
     remove(CONFIG_PIN_PATH);
+    remove(LBIP_PIN_PATH);
     printf("xdp_lb detached from %s\n", iface);
     return 0;
 }
@@ -268,6 +293,26 @@ static int cmd_del(const char *vip_s, const char *port_s)
     return 0;
 }
 
+static int cmd_setlbip(const char *ip_s)
+{
+    int fd = bpf_obj_get(LBIP_PIN_PATH);
+    if (fd < 0) {
+        fprintf(stderr, "cannot open %s (run 'attach' first)\n", LBIP_PIN_PATH);
+        return 1;
+    }
+    __u32 key = 0, ip = 0;
+    if (!inet_pton(AF_INET, ip_s, &ip)) {
+        fprintf(stderr, "invalid IP: %s\n", ip_s);
+        return 1;
+    }
+    if (bpf_map_update_elem(fd, &key, &ip, BPF_ANY)) {
+        fprintf(stderr, "bpf_map_update_elem(lbip_map): %s\n", strerror(errno));
+        return 1;
+    }
+    printf("LB source IP set to %s\n", ip_s);
+    return 0;
+}
+
 static int cmd_list()
 {
     int active_fd = bpf_obj_get(MAP_PIN_PATH);
@@ -317,6 +362,10 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "detach")) {
         if (argc < 3) { usage(argv[0]); return 1; }
         return cmd_detach(argv[2]);
+    }
+    if (!strcmp(cmd, "setlbip")) {
+        if (argc < 3) { usage(argv[0]); return 1; }
+        return cmd_setlbip(argv[2]);
     }
     if (!strcmp(cmd, "add")) {
         if (argc < 6) { usage(argv[0]); return 1; }

@@ -21,8 +21,7 @@
 
 #include "lb_common.h"
 
-// ── eBPF map: VIP+port → active backend pool ─────────────────────────────────
-// Written by lb_ctrl and lb_healthd; read at line rate by this program.
+// ── eBPF maps ─────────────────────────────────────────────────────────────────
 
 struct {
     __uint(type,        BPF_MAP_TYPE_HASH);
@@ -30,6 +29,15 @@ struct {
     __type(key,         struct vip_key);
     __type(value,       struct backends_val);
 } backends_map SEC(".maps");
+
+// Single-entry array holding the LB's own IP (network byte order).
+// Populated by lb_ctrl setlbip; used as saddr of the outer IP-in-IP header.
+struct {
+    __uint(type,        BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,         __u32);
+    __type(value,       __u32);
+} lbip_map SEC(".maps");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -121,11 +129,55 @@ int xdp_lb(struct xdp_md *ctx)
 
     struct backend_entry *be = &val->backends[idx];
 
-    // ── Rewrite L2 / L3 ──────────────────────────────────────────────────────
-    __builtin_memcpy(eth->h_dest, be->mac, ETH_ALEN);
-    iph->daddr = be->ip;
-    iph->check = 0;
-    iph->check = ip_csum(iph);
+    // ── DSR encapsulation: wrap packet in an outer IP-in-IP header ───────────
+    // The inner packet (src=client, dst=VIP) is never modified, so TCP/UDP
+    // checksums stay valid.  The backend decapsulates via an IPIP tunnel,
+    // sees the original VIP as the destination (configured on its loopback),
+    // and replies directly to the client with src=VIP.
+
+    __u32  lbip_key = 0;
+    __u32 *lbip = bpf_map_lookup_elem(&lbip_map, &lbip_key);
+    if (!lbip)
+        return XDP_PASS;
+
+    // Save before bpf_xdp_adjust_head invalidates all packet pointers.
+    __u32 be_ip;
+    __u8  be_mac[ETH_ALEN];
+    __builtin_memcpy(&be_ip,  &be->ip,  sizeof(be_ip));
+    __builtin_memcpy(be_mac,   be->mac,  ETH_ALEN);
+    __u16 inner_tot_len = bpf_ntohs(iph->tot_len);
+
+    // Prepend 20 bytes at the front for the outer IPv4 header.
+    if (bpf_xdp_adjust_head(ctx, -(int)sizeof(struct iphdr)))
+        return XDP_DROP;
+
+    // All pointers are stale after adjust_head — reload.
+    data     = (void *)(long)ctx->data;
+    data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *new_eth   = (struct ethhdr *)data;
+    struct iphdr  *outer_iph = (struct iphdr *)((__u8 *)data + sizeof(struct ethhdr));
+
+    if ((void *)(outer_iph + 1) > data_end)
+        return XDP_DROP;
+
+    // The original eth header is now at data+20; slide it to the new front.
+    __builtin_memcpy(new_eth, (__u8 *)data + sizeof(struct iphdr), sizeof(struct ethhdr));
+    __builtin_memcpy(new_eth->h_dest, be_mac, ETH_ALEN);
+
+    // Build outer IP header: LB_IP → backend_IP, protocol IPIP (4).
+    outer_iph->version  = 4;
+    outer_iph->ihl      = 5;
+    outer_iph->tos      = 0;
+    outer_iph->tot_len  = bpf_htons((__u16)(inner_tot_len + sizeof(struct iphdr)));
+    outer_iph->id       = 0;
+    outer_iph->frag_off = bpf_htons(IP_DF);
+    outer_iph->ttl      = 64;
+    outer_iph->protocol = IPPROTO_IPIP;
+    outer_iph->check    = 0;
+    outer_iph->saddr    = *lbip;
+    outer_iph->daddr    = be_ip;
+    outer_iph->check    = ip_csum(outer_iph);
 
     return XDP_TX;
 }
