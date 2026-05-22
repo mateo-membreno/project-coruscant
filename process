@@ -1,0 +1,7 @@
+wrote program here is what I learned
+    Networking
+    AWS
+    data plane vs control plane
+    iperf3
+
+got iperf stats for XDP performance, not so good (<10Mbits/sec) becasue i am running client on home internet, goign to try client being another ec2 instance
