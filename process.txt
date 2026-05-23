@@ -1,0 +1,23 @@
+Here are some learnings
+    XDP
+        - in kernel space inside NIC
+        - no memory alloc or copying packets to userspace
+        - can pass, drop, redirect, tx, or abort
+    dBPF
+        - system to run small verified progams in kernel
+    VIP of load balancer
+        - can be public or private depending on internal or external facing or priv network 
+    AWS
+        - Putting services on same subnet and VPC
+        - Setting security groups, TCP, SSH, ICMP access
+    Data Plane vs Control Plane
+    iperf3
+    Hash Rings - only flows by new/deleted servers are remapped but uneven distribution
+    Rendezvous hashing - good for dozens bad for thousands b/c lookup hashes against every server, good dist
+    Maglev hashing - table of backend servers that is 0(1) lookup, optimal update from maglev alg
+
+1. Got iperf3 stats for XDP performance, not so good (<10Mbits/sec) becasue i am running client on home internet, goign to try client being another ec2 instance
+2. A lot better now around 4.7GB/s where 5GB/s is max for t3.micro instance, right now it breaks when adding more backends because its not consistent 
+
+
+*how to improve throughput for public connections
