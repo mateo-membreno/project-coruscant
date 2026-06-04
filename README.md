@@ -17,8 +17,8 @@ Client
 │                                                     │
 │  1. Parse Eth / IP / TCP|UDP headers                │
 │  2. Lookup {dst_ip, dst_port} in backends_map       │
-│  3. Pick backend: idx = FNV1a(4-tuple) % pool_size  │
-│  4. Rewrite dst MAC + dst IP, fix IP checksum        │
+│  3. Pick backend: idx = maglev_table[FNV1a(4-tuple) % 251] │
+│  4. Rewrite dst MAC + dst IP, fix IP checksum       │
 │  5. XDP_TX → out the same interface                 │
 └─────────────────────────────────────────────────────┘
           │  reads
@@ -38,6 +38,7 @@ Client
 src/
   xdp_lb.c        — eBPF XDP kernel program (steps 1–3)
   lb_common.h     — shared structs: vip_key, backend_entry, backends_val
+  maglev.h        — Maglev table builder (userspace only): maglev_build()
   lb_ctrl.cpp     — C++ controller: attach/detach, add/del backends
   lb_healthd.cpp  — health-checker daemon: async TCP probes, auto remove/restore
 
@@ -52,16 +53,6 @@ scripts/
 spec              — step-by-step implementation guide
 ```
 
-## Steps
-
-| Step | What it adds | README |
-|------|-------------|--------|
-| 1 | Single hardcoded backend — proves XDP rewrite works | [README-step1.md](README-step1.md) |
-| 2 | eBPF hash map + C++ controller — live backend updates | [README-step2.md](README-step2.md) |
-| 3 | 4-tuple consistent hashing — connection pinning | [README-step3.md](README-step3.md) |
-| 4 | Health-checker daemon — auto remove/restore backends | [README-step4.md](README-step4.md) |
-| 5 *(planned)* | LRU connection table for DSR / encapsulation | — |
-
 ## Quick start
 
 ```bash
@@ -72,22 +63,88 @@ sudo ./scripts/install_deps.sh
 mkdir -p build && cd build && cmake .. && make
 
 # 3. Load XDP onto your interface (creates both maps)
-sudo ./build/lb_ctrl attach eth0
+sudo ./build/lb_ctrl attach enp0s5
 
-# 4. Register backends
-sudo ./build/lb_ctrl add 10.0.0.1 80 10.0.0.2 aa:bb:cc:dd:ee:ff
-sudo ./build/lb_ctrl add 10.0.0.1 80 10.0.0.3 bb:cc:dd:ee:ff:00
+# 4. Set the LB's own IP (used as outer IPIP source address)
+sudo ./build/lb_ctrl setlbip <lb-private-ip>
 
-# 5. Start the health checker
+# 5. Register backends
+sudo ./build/lb_ctrl add <vip-ip> <port> <backend-ip> <backend-mac>
+
+# 6. Start the health checker
 sudo ./build/lb_healthd &
 
-# 6. Inspect active state at any time
+# 7. Inspect active state at any time
 sudo ./build/lb_ctrl list
 
-# 7. Tear down
-sudo kill %1
-sudo ./build/lb_ctrl detach eth0
+# 8. Tear down
+sudo pkill lb_healthd
+sudo ./build/lb_ctrl detach enp0s5
 ```
+
+## Deployment
+
+Tested on three AWS EC2 t3.micro instances (Ubuntu 26.04, us-east-2, same VPC subnet):
+
+```
+┌─────────────────┐        ┌──────────────────────────────────┐
+│  Client EC2     │──────▶│  Load Balancer EC2               │
+│  (iperf3 -c)   │        │  <lb-private-ip>  enp0s5            │
+└─────────────────┘        │  XDP attached: xdp_lb.o          │
+                           │  lb_healthd running              │
+                           └──────────────┬───────────────────┘
+                                          │ IPIP encapsulation
+                                          ▼
+                           ┌──────────────────────────────────┐
+                           │  Backend EC2                     │
+                           │  iperf3 -s / python3 http.server │
+                           └──────────────────────────────────┘
+```
+
+All three instances in the same subnet so `XDP_TX` can reach backends over L2.
+The LB instance's security group allows inbound from the client instance's
+private IP and from the developer's laptop for SSH.
+
+### Setup commands used
+
+```bash
+# On LB instance
+sudo ./build/lb_ctrl attach enp0s5
+sudo ./build/lb_ctrl setlbip <lb-private-ip>
+sudo ./build/lb_ctrl add <lb-private-ip> 5201 <backend-private-ip> <backend-mac>
+sudo ./build/lb_healthd &
+```
+
+## Benchmarks
+
+### EC2 client → LB (same subnet, private IPs)
+
+```
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-10.00  sec  5.52 GBytes  4.74 Gbits/sec    (LB receiver)
+[  5]   0.00-10.00  sec  5.39 GBytes  4.63 Gbits/sec    (client sender)
+```
+
+**4.74 Gbits/sec** — approaching the t3.micro burst NIC cap of 5 Gbits/sec.
+XDP processes packets entirely in the kernel driver layer with zero copies,
+so the NIC is the bottleneck, not the load balancer.
+
+### Laptop → LB (over public internet, ~60ms RTT)
+
+```
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-10.01  sec  14.1 MBytes  11.8 Mbits/sec  1956
+```
+
+**11.8 Mbits/sec** with 1956 retransmits — limited entirely by home internet
+upload bandwidth and cross-country latency, not XDP.
+
+### Key takeaway
+
+XDP overhead is negligible at these packet rates. At ~4.7 Gbits/sec the LB
+forwards ~390,000 packets/sec (assuming ~1500 byte MTU) while consuming
+a fraction of one CPU core — the packet processing runs in the NIC driver
+interrupt context before any kernel networking code runs.
 
 ## Unit tests (no kernel / no root needed)
 
@@ -97,7 +154,7 @@ cd build && ./test_xdp_lb
 
 Output:
 ```
-xdp_lb tests (step 3: consistent hashing)
+xdp_lb tests (step 5: maglev consistent hashing)
 
 map / pass-through:
   tcp_with_map_entry_returns_xdp_tx          PASS
@@ -113,6 +170,10 @@ consistent hashing:
   hash_picks_computed_index                  PASS
   different_src_port_can_pick_different_backend  PASS
   udp_consistent_hash_matches_tcp_formula    PASS
+
+maglev table properties:
+  maglev_even_distribution                   PASS
+  maglev_minimal_disruption_on_remove        PASS
 ```
 
 ## lb_healthd options
