@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "lb_common.h"
+#include "maglev.h"
 
 // ── XDP return codes (mirrors linux/bpf.h) ───────────────────────────────────
 
@@ -135,9 +136,11 @@ static int process_packet(uint8_t *data, size_t len,
     if (!val || val->count == 0 || val->count > MAX_BACKENDS)
         return XDP_PASS;
 
-    uint32_t idx = hash_4tuple(ntohl(iph->saddr), ntohl(iph->daddr),
-                                sport, dport) % val->count;
-    if (idx >= MAX_BACKENDS) return XDP_PASS;
+    uint32_t slot = hash_4tuple(ntohl(iph->saddr), ntohl(iph->daddr),
+                                 sport, dport) % MAGLEV_M;
+    if (slot >= MAGLEV_M) return XDP_PASS;
+    uint32_t idx = val->maglev_table[slot];
+    if (idx >= val->count || idx >= MAX_BACKENDS) return XDP_PASS;
 
     const struct backend_entry *be = &val->backends[idx];
 
@@ -239,6 +242,7 @@ static struct backends_val make_pool(__u32 count)
         val.backends[i].ip = htonl(0x0a000001u + i); /* 10.0.0.1, 10.0.0.2, … */
         memcpy(val.backends[i].mac, macs[i], ETH_ALEN);
     }
+    maglev_build(&val);
     return val;
 }
 
@@ -418,13 +422,13 @@ TEST(single_backend_pool_always_index_0) {
 }
 
 TEST(hash_picks_computed_index) {
-    // Compute the expected index independently and verify the packet is
-    // rewritten to the matching backend.
+    // Compute the expected index via the Maglev table and verify the packet
+    // is rewritten to the matching backend.
     const uint16_t sport = 12345, dport = 443;
     struct backends_val val = make_pool(4);
 
-    uint32_t expected_idx =
-        hash_4tuple(SRC_IP, VIP_IP, sport, dport) % val.count;
+    uint32_t slot = hash_4tuple(SRC_IP, VIP_IP, sport, dport) % MAGLEV_M;
+    uint32_t expected_idx = val.maglev_table[slot];
 
     uint8_t buf[256];
     size_t len = tcp(buf, sizeof(buf), sport, dport);
@@ -432,21 +436,22 @@ TEST(hash_picks_computed_index) {
 
     struct ethhdr *eth = (struct ethhdr *)buf;
     CHECK(memcmp(eth->h_dest, val.backends[expected_idx].mac, ETH_ALEN) == 0,
-          "backend chosen does not match hash_4tuple computation");
+          "backend chosen does not match maglev table");
     PASS();
 }
 
 TEST(different_src_port_can_pick_different_backend) {
-    // With 4 backends and our hash, find two src ports that hash to different
-    // indices — proving the hash distributes across the pool.
+    // With 4 backends, find two src ports that resolve to different backends
+    // via the Maglev table — proving the hash distributes across the pool.
     struct backends_val val = make_pool(4);
 
-    int found_different = 0;
-    uint32_t first_idx = hash_4tuple(SRC_IP, VIP_IP, 1000, 80) % 4;
+    uint32_t slot0    = hash_4tuple(SRC_IP, VIP_IP, 1000, 80) % MAGLEV_M;
+    uint32_t first_idx = val.maglev_table[slot0];
 
+    int found_different = 0;
     for (uint16_t p = 1001; p < 2000; p++) {
-        uint32_t idx = hash_4tuple(SRC_IP, VIP_IP, p, 80) % 4;
-        if (idx != first_idx) { found_different = 1; break; }
+        uint32_t slot = hash_4tuple(SRC_IP, VIP_IP, p, 80) % MAGLEV_M;
+        if (val.maglev_table[slot] != first_idx) { found_different = 1; break; }
     }
     CHECK(found_different, "all src ports mapped to the same backend");
     PASS();
@@ -454,11 +459,12 @@ TEST(different_src_port_can_pick_different_backend) {
 
 TEST(udp_consistent_hash_matches_tcp_formula) {
     // The hash function doesn't care about L4 protocol; verify UDP uses the
-    // same formula by comparing expected index with actual rewrite.
+    // same Maglev table lookup as TCP.
     const uint16_t sport = 9999, dport = 5353;
     struct backends_val val = make_pool(3);
 
-    uint32_t expected_idx = hash_4tuple(SRC_IP, VIP_IP, sport, dport) % 3;
+    uint32_t slot = hash_4tuple(SRC_IP, VIP_IP, sport, dport) % MAGLEV_M;
+    uint32_t expected_idx = val.maglev_table[slot];
 
     uint8_t buf[256];
     size_t len = udp(buf, sizeof(buf), sport, dport);
@@ -466,7 +472,44 @@ TEST(udp_consistent_hash_matches_tcp_formula) {
 
     struct ethhdr *eth = (struct ethhdr *)buf;
     CHECK(memcmp(eth->h_dest, val.backends[expected_idx].mac, ETH_ALEN) == 0,
-          "UDP backend does not match hash formula");
+          "UDP backend does not match maglev table");
+    PASS();
+}
+
+// ── Maglev table property tests ───────────────────────────────────────────────
+
+TEST(maglev_even_distribution) {
+    // Each backend should own approximately MAGLEV_M / count slots.
+    struct backends_val val = make_pool(4);
+    uint32_t counts[4] = {0, 0, 0, 0};
+    for (int s = 0; s < MAGLEV_M; s++)
+        counts[val.maglev_table[s]]++;
+
+    uint32_t expected = MAGLEV_M / 4;   // ~62
+    for (int i = 0; i < 4; i++) {
+        // Allow ±25% slack.
+        CHECK(counts[i] >= expected * 3 / 4, "backend underrepresented in table");
+        CHECK(counts[i] <= expected * 5 / 4 + 1, "backend overrepresented in table");
+    }
+    PASS();
+}
+
+TEST(maglev_minimal_disruption_on_remove) {
+    // Remove the last backend from a 4-backend pool and verify that only
+    // ~1/4 of table slots change — not the ~3/4 that modulo hashing would cause.
+    struct backends_val full    = make_pool(4);
+    struct backends_val reduced = make_pool(3);  // same first 3 backends
+
+    uint32_t changed = 0;
+    for (int s = 0; s < MAGLEV_M; s++) {
+        if (full.maglev_table[s] != reduced.maglev_table[s])
+            changed++;
+    }
+
+    // Ideal: ~MAGLEV_M/4 ≈ 63 slots change.  Allow 2× slack in both directions.
+    uint32_t expected = MAGLEV_M / 4;
+    CHECK(changed >= expected / 2, "suspiciously few slots changed");
+    CHECK(changed <= expected * 2, "too many slots changed — not minimal disruption");
     PASS();
 }
 
@@ -495,7 +538,7 @@ TEST(checksum_correct_for_known_header) {
 
 int main(void)
 {
-    printf("xdp_lb tests (step 3: consistent hashing)\n\n");
+    printf("xdp_lb tests (step 5: maglev consistent hashing)\n\n");
 
     printf("map / pass-through:\n");
     RUN(tcp_with_map_entry_returns_xdp_tx);
@@ -520,6 +563,10 @@ int main(void)
     RUN(hash_picks_computed_index);
     RUN(different_src_port_can_pick_different_backend);
     RUN(udp_consistent_hash_matches_tcp_formula);
+
+    printf("\nmaglev table properties:\n");
+    RUN(maglev_even_distribution);
+    RUN(maglev_minimal_disruption_on_remove);
 
     printf("\nchecksum:\n");
     RUN(checksum_correct_for_known_header);

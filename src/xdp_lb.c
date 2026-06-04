@@ -124,15 +124,18 @@ int xdp_lb(struct xdp_md *ctx)
     if (!val || val->count == 0 || val->count > MAX_BACKENDS)
         return XDP_PASS;
 
-    // ── Consistent hash: same flow → same backend ─────────────────────────────
-    // The explicit idx >= MAX_BACKENDS guard satisfies the BPF verifier even
-    // though count <= MAX_BACKENDS already bounds idx.
-    __u32 idx = hash_4tuple(iph->saddr, iph->daddr, sport, dport) % val->count;
-    if (idx >= MAX_BACKENDS)
+    // ── Maglev lookup: hash flow to a table slot, then read backend index ────────
+    // slot is bounded to [0, MAGLEV_M-1] by the modulo; the explicit check gives
+    // the BPF verifier a concrete bound for the array access into maglev_table.
+    __u32 slot = hash_4tuple(iph->saddr, iph->daddr, sport, dport) % MAGLEV_M;
+    if (slot >= MAGLEV_M)
         return XDP_PASS;
-    // LLVM proves idx < count ≤ MAX_BACKENDS and removes a plain mask as a no-op.
-    // The asm barrier breaks that alias analysis so the AND is emitted, giving
-    // the BPF verifier a concrete bitmask it can use to bound the value.
+
+    __u32 idx = val->maglev_table[slot];
+    if (idx >= val->count || idx >= MAX_BACKENDS)
+        return XDP_PASS;
+    // asm barrier + mask give the BPF verifier a concrete bitmask to bound idx
+    // for the backends[] array access that follows.
     asm volatile("" : "+r"(idx));
     idx &= MAX_BACKENDS - 1;
 

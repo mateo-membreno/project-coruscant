@@ -37,6 +37,7 @@
 #include <bpf/libbpf.h>
 
 #include "lb_common.h"
+#include "maglev.h"
 
 static constexpr const char *MAP_PIN_PATH    = "/sys/fs/bpf/lb_backends";
 static constexpr const char *CONFIG_PIN_PATH = "/sys/fs/bpf/lb_config";
@@ -193,6 +194,7 @@ public:
 
             // Rewrite the active map entry (or remove if all backends are down).
             if (active.count > 0) {
+                maglev_build(&active);
                 bpf_map_update_elem(active_fd_, &e.key, &active, BPF_ANY);
             } else {
                 // All backends down: remove VIP so XDP passes packets through.

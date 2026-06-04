@@ -31,6 +31,7 @@
 #include <bpf/libbpf.h>
 
 #include "lb_common.h"
+#include "maglev.h"
 
 static constexpr const char *MAP_PIN_PATH    = "/sys/fs/bpf/lb_backends";
 static constexpr const char *CONFIG_PIN_PATH = "/sys/fs/bpf/lb_config";
@@ -262,6 +263,7 @@ static int cmd_add(const char *vip_s, const char *port_s,
         return 1;
     }
     val.count++;
+    maglev_build(&val);
 
     if (!map_write(config_fd, &key, &val, "config_map")) return 1;
     if (!map_write(active_fd, &key, &val, "backends_map")) return 1;

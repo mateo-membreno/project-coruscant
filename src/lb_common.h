@@ -17,6 +17,7 @@ typedef uint32_t __u32;
 #endif
 
 #define MAX_BACKENDS 16
+#define MAGLEV_M     251   // lookup table size — must be prime
 
 // Hash-map key: the virtual IP + destination port the load balancer owns.
 // vip is in network byte order; port is in host byte order.
@@ -36,7 +37,12 @@ struct backend_entry {
 
 // Map value: the pool of backends registered for a given VIP+port.
 // Only indices [0, count) are valid.
+// maglev_table[slot] → backend index; built by maglev_build() in userspace
+// whenever the pool changes.  The XDP program does a single O(1) lookup:
+//   idx = maglev_table[hash_4tuple(...) % MAGLEV_M]
 struct backends_val {
-    __u32               count;
+    __u32                count;
     struct backend_entry backends[MAX_BACKENDS];
+    __u8                 maglev_table[MAGLEV_M];
+    __u8                 _pad2[1];   // pad struct to 4-byte boundary (4+192+251+1=448)
 };
