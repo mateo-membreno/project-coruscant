@@ -6,6 +6,8 @@ stack — and their L2/L3 destination is rewritten in place.  A C++ controller
 manages the backend pool via eBPF shared-memory maps; no program reload is
 ever needed to add, remove, or recover a backend.
 
+**need to add caching for connections that remap while open**
+
 ## Architecture
 
 ```
